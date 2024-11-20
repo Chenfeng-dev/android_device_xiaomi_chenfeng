@@ -1,144 +1,78 @@
 #!/bin/bash
+#
+# Copyright (C) 2016 The CyanogenMod Project
+# Copyright (C) 2017-2020 The LineageOS Project
+#
+# SPDX-License-Identifier: Apache-2.0
+#
 
 set -e
 
-EXTRACT_OTA=../../../prebuilts/extract-tools/linux-x86/bin/ota_extractor
-MKDTBOIMG=../../../system/libufdt/utils/src/mkdtboimg.py
-UNPACKBOOTIMG=../../../system/tools/mkbootimg/unpack_bootimg.py
-ROM_ZIP=$1
+DEVICE=chenfeng
+VENDOR=xiaomi
 
-error_handler() {
-    if [[ -d $extract_out ]]; then
-        echo "Error detected, cleaning temporal working directory $extract_out"
-        rm -rf $extract_out
-    fi
-}
+# Load extract_utils and do some sanity checks
+MY_DIR="${BASH_SOURCE%/*}"
+if [[ ! -d "${MY_DIR}" ]]; then MY_DIR="${PWD}"; fi
 
-trap error_handler ERR
+ANDROID_ROOT="${MY_DIR}/../../.."
 
-function usage() {
-	echo "Usage: ./extract-files.sh <rom-zip>"
-	exit 1
-}
+HELPER="${ANDROID_ROOT}/tools/extract-utils/extract_utils.sh"
+if [ ! -f "${HELPER}" ]; then
+    echo "Unable to find helper script at ${HELPER}"
+    exit 1
+fi
+source "${HELPER}"
 
-function get_path() {
-	echo "$extract_out/$1"
-}
+# Default to sanitizing the vendor folder before extraction
+CLEAN_VENDOR=true
 
-function unpackbootimg() {
-	$UNPACKBOOTIMG $@
-}
+KANG=
+SECTION=
 
-function extract_ota() {
-    $EXTRACT_OTA $@
-}
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -n | --no-cleanup )
+                CLEAN_VENDOR=false
+                ;;
+        -k | --kang )
+                KANG="--kang"
+                ;;
+        -s | --section )
+                SECTION="${2}"; shift
+                CLEAN_VENDOR=false
+                ;;
+        * )
+                SRC="${1}"
+                ;;
+    esac
+    shift
+done
 
-if [[ ! -f $UNPACKBOOTIMG ]]; then
-	echo "Missing $UNPACKBOOTIMG, are you on the correct directory?"
-	exit 1
+if [ -z "${SRC}" ]; then
+    SRC="adb"
 fi
 
-if [[ ! -f $EXTRACT_OTA ]]; then
-	echo "Missing $EXTRACT_OTA, are you on the correct directory and have built the ota_extractor target?"
-	exit 1
-fi
+function blob_fixup() {
+    case "${1}" in
+        odm/etc/camera/enhance_motiontuning.xml|odm/etc/camera/motiontuning.xml|odm/etc/camera/night_motiontuning.xml)
+            sed -i 's/xml=version/xml version/g' "${2}"
+            ;;
+        system_ext/etc/vintf/manifest/vendor.qti.qesdsys.service.xml)
+            sed -i '1,6d' "${2}"
+            ;;
+        system_ext/lib64/libwfdnative.so)
+            ${PATCHELF} --remove-needed "android.hidl.base@1.0.so" "${2}"
+            ;;
+        vendor/bin/init.qcom.usb.sh)
+            sed -i 's/ro.product.marketname/ro.product.odm.marketname/g' "${2}"
+            ;;
+    esac
+}
 
-if [[ -z $ROM_ZIP ]] || [[ ! -f $ROM_ZIP ]]; then
-	usage
-fi
+# Initialize the helper
+setup_vendor "${DEVICE}" "${VENDOR}" "${ANDROID_ROOT}" false "${CLEAN_VENDOR}"
 
-# Clean and create needed directories
-for dir in ./modules/vendor_dlkm ./modules/system_dlkm ./modules/vendor_boot ./images ./images/dtbs; do
-    rm -rf $dir
-    mkdir -p $dir
-done
+extract "${MY_DIR}/proprietary-files.txt" "${SRC}" "${KANG}" --section "${SECTION}"
 
-# Extract the OTA package
-extract_out=$(mktemp -d)
-echo "Using $extract_out as working directory"
-
-echo "Extracting the payload from $ROM_ZIP"
-unzip $ROM_ZIP payload.bin -d $extract_out
-
-echo "Extracting OTA images"
-extract_ota -payload $extract_out/payload.bin -output_dir $extract_out -partitions boot,dtbo,vendor_boot,vendor_dlkm,system_dlkm
-
-# BOOT
-echo "Extracting the kernel image from boot.img"
-out=$extract_out/boot-out
-mkdir $out
-
-echo "Extracting at $out"
-unpackbootimg --boot_img $(get_path boot.img) --out $out --format mkbootimg
-
-echo "Done. Copying the kernel"
-cp $out/kernel ./images/kernel
-echo "Done"
-
-# VENDOR_BOOT
-echo "Extracting the ramdisk kernel modules and DTB"
-out=$extract_out/vendor_boot-out
-mkdir $out
-
-echo "Extracting at $out"
-unpackbootimg --boot_img $(get_path vendor_boot.img) --out $out --format mkbootimg
-
-echo "Done. Extracting the ramdisk"
-mkdir $out/ramdisk
-unlz4 $out/vendor_ramdisk00 $out/vendor_ramdisk
-cpio -i -F $out/vendor_ramdisk -D $out/ramdisk
-
-echo "Copying all ramdisk modules"
-for module in $(find $out/ramdisk -name "*.ko" -o -name "modules.load*" -o -name "modules.blocklist"); do
-	cp $module ./modules/vendor_boot/
-done
-
-# VENDOR_DLKM
-echo "Extracting the dlkm kernel modules"
-out=$extract_out/vendor_dlkm
-
-echo "Extracting at $out"
-fsck.erofs --extract="$out" $(get_path vendor_dlkm.img)
-
-echo "Done. Extracting the vendor dlkm"
-
-echo "Copying all vendor dlkm modules"
-for module in $(find $out/lib -name "*.ko" -o -name "modules.load*" -o -name "modules.blocklist"); do
-	cp $module ./modules/vendor_dlkm/
-done
-
-# SYSTEM_DLKM
-echo "Extracting the dlkm kernel modules"
-out=$extract_out/system_dlkm
-
-echo "Extracting at $out"
-fsck.erofs --extract="$out" $(get_path system_dlkm.img)
-
-echo "Done. Extracting the system dlkm"
-
-echo "Copying all system dlkm modules"
-cp -r $out/lib/modules/6.1* ./modules/system_dlkm/
-
-# Extract DTBO and DTBs
-echo "Extracting DTBO and DTBs"
-
-curl -sSL "https://raw.githubusercontent.com/PabloCastellano/extract-dtb/master/extract_dtb/extract_dtb.py" > ${extract_out}/extract_dtb.py
-
-# Copy DTB
-python3 "${extract_out}/extract_dtb.py" "${extract_out}/vendor_boot-out/dtb" -o "${extract_out}/dtbs" > /dev/null
-find "${extract_out}/dtbs" -type f -name "*.dtb" \
-    -exec cp {} ./images/dtbs/ \; \
-    -exec printf "  - dtbs/" \; \
-    -exec basename {} \;
-
-cp -f "${extract_out}/dtbo.img" ./images/dtbo.img
-echo "Done"
-
-# Add touch modules to vendorboot for recovery
-for module in xiaomi_touch.ko goodix_core.ko focaltech_touch.ko; do
-    cp modules/vendor_dlkm/$module modules/vendor_boot/
-    echo $module >> modules/vendor_boot/modules.load.recovery
-done
-
-rm -rf $extract_out
-echo "Extracted files successfully"
+"${MY_DIR}/setup-makefiles.sh"
